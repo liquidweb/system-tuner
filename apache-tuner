@@ -1207,9 +1207,15 @@ get_current_values_with_precedence() {
     CUR_MAX_SPARE_SERVERS=""
     CUR_MAX_CONN_PER_CHILD=""
 
-    # 1) cPanel include wins
-    if [[ "$IS_CPANEL" -eq 1 && -n "${PREFORK_INCLUDE:-}" && -f "$PREFORK_INCLUDE" ]]; then
-        parse_file_for_directives "$PREFORK_INCLUDE"
+    # 1) include files applied by the tuner win
+    if [[ "$IS_CPANEL" -eq 1 ]]; then
+        if [[ -n "${PREFORK_INCLUDE:-}" && -f "$PREFORK_INCLUDE" ]]; then
+            parse_file_for_directives "$PREFORK_INCLUDE"
+        elif [[ -n "$INCLUDES_DIR" && -f "${INCLUDES_DIR}/pre_main_global.conf" ]]; then
+            parse_file_for_directives "${INCLUDES_DIR}/pre_main_global.conf"
+        fi
+    elif [[ -n "$INCLUDES_DIR" && -f "${INCLUDES_DIR}/apache-smart-tuner.conf" ]]; then
+        parse_file_for_directives "${INCLUDES_DIR}/apache-smart-tuner.conf"
     fi
 
     # 2) Runtime (DUMP_RUN_CFG) fills blanks
