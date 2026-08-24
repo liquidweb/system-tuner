@@ -1,0 +1,195 @@
+#!/bin/bash
+export PATH=/sbin:/bin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin
+#default to 'today' if arg not given
+range="${1:-today}"
+format="$2"
+opt="$3"
+sysstat_data="/var/log/sa"
+sar=$(which sar 2> /dev/null)
+# weight factor is what number the metric is divided by before reporting
+# this can be used to lower the weight of a certain metric in the final score
+users_weight_factor='10'
+# config file can override default weight settings
+conf_file='/etc/serverweight.conf'
+settings='users_weight_factor'
+if [[ -f "$conf_file" ]]; then
+    for setting in $settings; do
+        if grep -q "^${setting}=[0-9]*" "$conf_file" 2>/dev/null; then
+            setting_value="$(awk -F= "/^${setting}/ {print \$NF}" "$conf_file")"
+            if grep -qE '^[0-9]*$' 2>/dev/null <<< "$setting_value"; then
+                eval "${setting}=${setting_value}"
+            fi
+        fi
+    done
+fi
+
+
+if [ ! -d "$sysstat_data" ] || [ ! -f "$sar" ]; then
+        echo "could not find sysstat data path, is sysstat installed?"
+        exit 1
+fi
+
+bc=$(which bc 2> /dev/null)
+if [ ! -f "$bc" ]; then
+        echo "could not find berkley calculator (bc), is bc installed?"
+        exit 1
+fi
+
+get_weight() {
+        safile="$1"
+        format="$2"
+        opt="$3"
+
+        # how many reboots in the last 72h
+        restart_count=0
+        for j in $(find "${sysstat_data}/" -type f -regex '.*\/sa[0-9]*' -printf '%T@ %P\n' | sort -n | awk '{print $NF}' | tail -n3); do
+                restarts=$(sar -q -f "${sysstat_data}/${j}" 2> /dev/null | grep -Ec RESTART)
+                restart_count=$((restarts+restart_count))
+        done
+        if [ ! "$restart_count" -eq "0" ]; then
+                uptime=$(echo "$restart_count * 5" | $bc)
+        else
+                uptime="0"
+        fi
+
+        # cpu idle cycles
+        cpu=$(echo "scale=2 ; (100 - $(LC_TIME='POSIX' sar -f "$safile" 2> /dev/null | grep -Ev '^$|Average|idle' | awk '{print$8}' | sort -n | awk 'BEGIN{c=0} {total[c]=$1; c++;} END{print total[int(NR*0.95-0.5)]}' )) / 10" | $bc)
+        # weight cpu usage higher at 70, 80 and 90% (30, 20 and 10% idle)
+        if [ "$(echo "$cpu" | sed 's/^\./0./' | cut -d'.' -f1)" -gt "9" ]; then
+                multi=6
+        elif [ "$(echo "$cpu" | sed 's/^\./0./' | cut -d'.' -f1)" -gt "8" ]; then
+                multi=5
+        elif [ "$(echo "$cpu" | sed 's/^\./0./' | cut -d'.' -f1)" -gt "7" ]; then
+                multi=4
+        else
+                multi=2
+        fi
+        cpu=$(echo "scale=2 ; $cpu * $multi" | $bc)
+
+        # load 95th, smooth out spikes and noramlize
+        load=$(LC_TIME='POSIX' sar -f "$safile" -q 2> /dev/null | grep -Evi "^$|average|linux|ldavg" | awk '{print$4}' | sort -n | awk 'BEGIN{c=0} {total[c]=$1; c++;} END{print total[int(NR*0.95-0.5)]}')
+
+        # iowait
+        # we need to weigh iowait heavily as it has a cascading impact on system performance
+        iow=$(echo "scale=2 ;  $(LC_TIME='POSIX' sar -f "$safile" 2> /dev/null | tail -n1 | awk '{print$6}')" | $bc)
+        if [ "$(echo "$iow" | sed 's/^\./0./' | cut -d'.' -f1)" -ge "6" ]; then
+                multi=6
+        elif [ "$(echo "$iow" | sed 's/^\./0./' | cut -d'.' -f1)" -ge "4" ]; then
+                multi=5
+        elif [ "$(echo "$iow" | sed 's/^\./0./' | cut -d'.' -f1)" -ge "2" ]; then
+                multi=4
+        else
+                multi=2
+        fi
+        iow=$(echo "scale=2 ; $iow * $multi" | $bc)
+
+        # await
+        # we add await to help contexualize iowait, we need to weight this less heavily than iowait
+        aw=$(LC_TIME='POSIX' sar  -d 2> /dev/null | grep -Evi "^$|average|await|restart|linux" | awk '{print$8}' | sort -n | awk 'BEGIN{c=0} {total[c]=$1; c++;} END{print total[int(NR*0.95-0.5)]}')
+        multi=1
+        aw=$(echo "scale=2 ; ($aw * $multi) *0.10" | $bc)
+
+        # what does our home usage look like?
+        duse=$(df -m / /var /usr /home | grep -E dev | sort -n -k5 | tail -n1 | awk '{print$5}' | tr -d '%')
+        if [ "$duse" -ge "90" ]; then
+                duse=$(echo "scale=2 ; ($duse * 5)/10" | $bc)
+        elif [ "$duse" -ge "80" ]; then
+                duse=$(echo "scale=2 ; ($duse * 4)/10" | $bc)
+        elif [ "$duse" -ge "70" ]; then
+                duse=$(echo "scale=2 ; ($duse * 3)/10" | $bc)
+        elif [ "$duse" -ge "60" ]; then
+                duse=$(echo "scale=2 ; ($duse * 2)/10" | $bc)
+        else
+                duse=$(echo "scale=2 ; ($duse * 1)/10" | $bc)
+        fi
+
+        # user counts cpanel and non-cpanel
+        if [ -d "/var/cpanel/users" ]; then
+                users=$(echo "scale=2 ; $(find /var/cpanel/users -maxdepth 1 -type f | wc -l) / ${users_weight_factor}" | $bc)
+        else
+        # nex users start at uid 60000 so we limit out upper bound so we don't include them
+        # these users do not exist in /etc/passwd on systems using freeipa so this only
+        # applies on el6 right now
+                users=$(echo "scale=2 ; $(awk -F':' '{if($3>=500 && $3<60000){print$1}}' /etc/passwd | wc -l) / ${users_weight_factor}" | $bc)
+        fi
+
+        # this is our running processes size 95th, smooth out spikes and normalized
+        procs=$(grep -E processor /proc/cpuinfo  -c)
+        runsz=$(LC_TIME='POSIX' sar -f "$safile" -q 2> /dev/null | grep -Evi "^$|average|linux|ldavg" | awk '{print$2}' | sort -n | awk 'BEGIN{c=0} {total[c]=$1; c++;} END{print total[int(NR*0.95-0.5)]}')
+        if [ "$runsz" -gt "$procs" ]; then
+                runsz=$(echo "scale=2 ; $runsz * 1.5" | bc)
+        fi
+        runq=$(echo "scale=2 ; $runsz / 10" | $bc)
+
+        # memory pressure (commit) and swap use averages, normalized for Cent5 & 6
+        if grep -qE '5.[0-9]+' /etc/redhat-release; then
+                mempress=$(echo "scale=2 ; $(LC_TIME=POSIX sar -f "$safile" -r 2> /dev/null | grep -Evi '^$|average|linux|commit|memused' | awk '{sum+=$4} END {printf "%.2f", sum/NR}') / 10" | $bc)
+                swapuse=$(echo "scale=2 ; $(LC_TIME=POSIX sar -f "$safile" -r 2> /dev/null | grep -Evi '^$|linux|average|swpcad' | awk '{sum+=$9} END {printf "%.2f", sum/NR}') / 10" | $bc)
+        else
+                memcommit=$(echo "scale=2 ; $(LC_TIME=POSIX sar -f "$safile" -r 2> /dev/null | grep -Evi '^$|average|linux|commit' | awk '{sum+=$8} END {printf "%.2f", sum/NR}') / 10" | $bc)
+                memuse=$(echo "scale=2 ; $(LC_TIME=POSIX sar -f "$safile" -r 2> /dev/null | grep -Evi '^$|average|linux|commit' | awk '{sum+=$4} END {printf "%.2f", sum/NR}') / 10" | $bc)
+                mempress=$(echo "scale=2 ; $memcommit + $memuse" | $bc)
+                swapuse=$(echo "scale=2 ; $(LC_TIME=POSIX sar -f "$safile" -S 2> /dev/null | grep -Evi '^$|linux|average|swpcad' | awk '{sum+=$4} END {printf "%.2f", sum/NR}') / 10" | $bc)
+        fi
+        if (( $(echo "$mempress >= 100" | bc -l) )); then
+                mempress=5
+        elif (( $(echo "$swapuse >= 100" | bc -l) )); then
+                swapuse=5
+        fi
+
+        cpu=${cpu:-0}
+        iow=${iow:-0}
+        aw=${aw:-0}
+        load=${load:-0}
+        runq=${runq:-0}
+        mempress=${mempress:-0}
+        swapuse=${swapuse:-0}
+        duse=${duse:-0}
+        users=${users:-0}
+        uptime=${uptime:-0}
+
+        weight=$(echo "scale=2; $cpu + $iow + $aw + $load + $runq + $mempress + $swapuse + $duse + $users + $uptime" | $bc)
+        if [ "$format" == "csv" ]; then
+                echo "$date,$HOSTNAME,$cpu,$iow,$aw,$load,$mempress,$swapuse,$runq,$duse,$users,$uptime,$weight"
+                elif [ "$format" == "json" ]; then
+                echo -e "{\"$HOSTNAME\": { \"date\": \"$date\", \"hostname\": \"$HOSTNAME\", \"cpu\": $cpu, \"iowait\": $iow, \"await\": $aw, \"load95th\": $load, \"memory\": $mempress, \"swap\": $swapuse, \"runsz\": $runq, \"disk\": $duse, \"users\": $users, \"uptime\": $uptime, \"weight\": $weight }}"
+        else
+                echo "$date $HOSTNAME cpu $cpu iowait $iow await $aw load95th $load memory $mempress swap $swapuse runsz $runq disk $duse users $users uptime $uptime weight $weight"
+        fi
+}
+
+
+# we by default run for current day / yesterday weight output
+# if $1 = range then trend weight data output
+if [ "$range" == "trend" ]; then
+        for i in $(find "${sysstat_data}/" -type f -regex '.*\/sa[0-9]*' -printf '%T@ %P\n' | sort -n | awk '{print $NF}'); do
+                date=$(stat -c '%z' "${sysstat_data}/${i}" | awk '{print$1}')
+                get_weight "${sysstat_data}/${i}" "$format" "$opt"
+                ((count++))
+                weight_sum=$(echo "scale=2; ${weight_sum:-0} + ${weight:-0}" | bc)
+        done
+        weight_avg=$(echo "scale=2; $weight_sum / $count" | $bc)
+        if [ "$format" == "csv" ]; then
+                echo "AVERAGE,$HOSTNAME,weight_avg,$weight_avg"
+        elif [ "$format" == "json" ]; then
+                echo -e "{\"$HOSTNAME\": { \"average_weight\": \"$weight_avg\" }}"
+        else
+                echo "AVERAGE $HOSTNAME weight_avg $weight_avg"
+        fi
+elif [ "$range" == "today" ]; then
+        if [ "$(date +'%R' | cut -d ':' -f1)" -lt "12" ]; then
+                day="yesterday"
+        else
+                day="today"
+        fi
+        safile="$sysstat_data/sa$(date -d $day +'%d')"
+        date=$(stat -c '%z' "$safile" | awk '{print$1}')
+
+        get_weight "$safile" "$format" "$opt"
+elif [ "$range" == "yesterday" ]; then
+        day="$range"
+        safile="$sysstat_data/sa$(date -d "$day" +'%d')"
+        date=$(stat -c '%z' "$safile" | awk '{print$1}')
+
+        get_weight "$safile" "$format" "$opt"
+fi
