@@ -13,7 +13,9 @@
 #     * MID-HIGH:  2048
 #     * HIGH:      4096
 # - Floors:
-#     * Prefork:   ServerLimit / MaxRequestWorkers >= 128
+#     * Prefork:   MaxRequestWorkers floor of 128 applies only when the RAM
+#                  budget supports it; small servers keep the RAM-derived
+#                  value (absolute minimum 16)
 #     * Event/worker: MaxRequestWorkers >= 128 (threads)
 # - Doubles effective concurrency on LOW and LOW-MID tiers (within caps)
 # - Applies RAM, CPU, and tier-based global caps to MaxRequestWorkers
@@ -31,7 +33,7 @@
 set -u   # keep "undefined var" safety; avoid -e/pipefail to prevent silent exits
 
 VERSION_MAJOR=1
-VERSION_MINOR=20
+VERSION_MINOR=21
 VERSION_PATCH=0
 VERSION="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}"
 VERSION_NAME="Apache Smart Tuner v${VERSION}"
@@ -142,8 +144,6 @@ parse_cli_arguments() {
                 case "$OPTARG" in
                     analyze)
                         set_mode "analyze"
-                        OUTPUT_FORMAT="text"
-                        RELOAD_AFTER_APPLY=1
                         ;;
                     locate)
                         set_mode "locate"
@@ -397,19 +397,15 @@ round_down_to_multiple_of_8() {
         return
     fi
 
-    if [[ "$VALUE" -eq 1 || "$VALUE" -eq 2 ]]; then
+    # Values below one multiple pass through unchanged; rounding them to 8
+    # would round up and inflate small tuned values (spares, StartServers,
+    # threaded process counts).
+    if [[ "$VALUE" -lt "$MULTIPLE" ]]; then
         echo "$VALUE"
         return
     fi
 
-    local REMAINDER=$(( VALUE % MULTIPLE ))
-    local NEW_VALUE=$(( VALUE - REMAINDER ))
-
-    if [[ "$NEW_VALUE" -lt 1 ]]; then
-        echo "$MULTIPLE"
-    else
-        echo "$NEW_VALUE"
-    fi
+    echo $(( VALUE - (VALUE % MULTIPLE) ))
 }
 
 round_up_to_multiple_of_8() {
@@ -714,7 +710,10 @@ PY
         print @collected;
     ' "$APACHE_ERROR_LOG" "$cutoff_epoch" 2>/dev/null || true)
 
-    ERROR_LOG_SAMPLE_LINES=$(wc -l <<< "$LOG_SAMPLE_CONTENT")
+    # A herestring appends a newline, so an empty sample would count as 1 line.
+    if [[ -n "$LOG_SAMPLE_CONTENT" ]]; then
+        ERROR_LOG_SAMPLE_LINES=$(wc -l <<< "$LOG_SAMPLE_CONTENT")
+    fi
 
     if [[ "$ERROR_LOG_SAMPLE_LINES" -eq 0 ]]; then
         LOG_REVIEW_STATUS="empty"
@@ -841,63 +840,82 @@ infer_mpm_from_config() {
     echo ""
 }
 
-set_tier_params() { 
+set_tier_params() {
+    # Tier is selected by RAM first; a box that lacks the core count expected
+    # for its RAM tier is demoted one tier (conservative) rather than falling
+    # through to a higher tier.
     if [[ "$TOTAL_MEM" -le 2048 || "$CORES" -le 2 ]]; then
         TIER="LOW"
-        APACHE_PCT="0.30"
-        PROCS_PER_CORE_CAP=64
-        THREADS_PER_CORE_CAP=200
-        START_SERVERS=1
-        MIN_SPARE=1
-        MAX_SPARE=2
-        MAX_CONN_PER_CHILD=2000
-        MRW_CAP_PREFORK=128
-        MRW_CAP_THREADED=128
-    elif [[ "$TOTAL_MEM" -le 8192 && "$CORES" -ge 2 ]]; then
+    elif [[ "$TOTAL_MEM" -le 8192 ]]; then
         TIER="LOW-MID"
-        APACHE_PCT="0.35"
-        PROCS_PER_CORE_CAP=64
-        THREADS_PER_CORE_CAP=220
-        START_SERVERS=2
-        MIN_SPARE=2
-        MAX_SPARE=5
-        MAX_CONN_PER_CHILD=4000
-        MRW_CAP_PREFORK=256
-        MRW_CAP_THREADED=256
-    elif [[ "$TOTAL_MEM" -le 16384 && "$CORES" -ge 4 ]]; then
+    elif [[ "$TOTAL_MEM" -le 16384 ]]; then
         TIER="MID"
-        APACHE_PCT="0.40"
-        PROCS_PER_CORE_CAP=48
-        THREADS_PER_CORE_CAP=200
-        START_SERVERS=3
-        MIN_SPARE=3
-        MAX_SPARE=8
-        MAX_CONN_PER_CHILD=6000
-        MRW_CAP_PREFORK=1024
-        MRW_CAP_THREADED=1024
-    elif [[ "$TOTAL_MEM" -le 32768 && "$CORES" -ge 8 ]]; then
+        [[ "$CORES" -lt 4 ]] && TIER="LOW-MID"
+    elif [[ "$TOTAL_MEM" -le 32768 ]]; then
         TIER="MID-HIGH"
-        APACHE_PCT="0.43"
-        PROCS_PER_CORE_CAP=44
-        THREADS_PER_CORE_CAP=200
-        START_SERVERS=4
-        MIN_SPARE=4
-        MAX_SPARE=10
-        MAX_CONN_PER_CHILD=8000
-        MRW_CAP_PREFORK=2048
-        MRW_CAP_THREADED=2048
+        [[ "$CORES" -lt 8 ]] && TIER="MID"
     else
         TIER="HIGH"
-        APACHE_PCT="0.45"
-        PROCS_PER_CORE_CAP=40
-        THREADS_PER_CORE_CAP=200
-        START_SERVERS=5
-        MIN_SPARE=5
-        MAX_SPARE=12
-        MAX_CONN_PER_CHILD=10000
-        MRW_CAP_PREFORK=4096
-        MRW_CAP_THREADED=4096
+        [[ "$CORES" -lt 8 ]] && TIER="MID-HIGH"
     fi
+
+    case "$TIER" in
+        LOW)
+            APACHE_PCT="0.30"
+            PROCS_PER_CORE_CAP=64
+            THREADS_PER_CORE_CAP=200
+            START_SERVERS=1
+            MIN_SPARE=1
+            MAX_SPARE=2
+            MAX_CONN_PER_CHILD=2000
+            MRW_CAP_PREFORK=128
+            MRW_CAP_THREADED=128
+            ;;
+        LOW-MID)
+            APACHE_PCT="0.35"
+            PROCS_PER_CORE_CAP=64
+            THREADS_PER_CORE_CAP=220
+            START_SERVERS=2
+            MIN_SPARE=2
+            MAX_SPARE=5
+            MAX_CONN_PER_CHILD=4000
+            MRW_CAP_PREFORK=256
+            MRW_CAP_THREADED=256
+            ;;
+        MID)
+            APACHE_PCT="0.40"
+            PROCS_PER_CORE_CAP=48
+            THREADS_PER_CORE_CAP=200
+            START_SERVERS=3
+            MIN_SPARE=3
+            MAX_SPARE=8
+            MAX_CONN_PER_CHILD=6000
+            MRW_CAP_PREFORK=1024
+            MRW_CAP_THREADED=1024
+            ;;
+        MID-HIGH)
+            APACHE_PCT="0.43"
+            PROCS_PER_CORE_CAP=44
+            THREADS_PER_CORE_CAP=200
+            START_SERVERS=4
+            MIN_SPARE=4
+            MAX_SPARE=10
+            MAX_CONN_PER_CHILD=8000
+            MRW_CAP_PREFORK=2048
+            MRW_CAP_THREADED=2048
+            ;;
+        HIGH)
+            APACHE_PCT="0.45"
+            PROCS_PER_CORE_CAP=40
+            THREADS_PER_CORE_CAP=200
+            START_SERVERS=5
+            MIN_SPARE=5
+            MAX_SPARE=12
+            MAX_CONN_PER_CHILD=10000
+            MRW_CAP_PREFORK=4096
+            MRW_CAP_THREADED=4096
+            ;;
+    esac
 
     if [[ -n "$BUDGET_OVERRIDE" ]]; then
         APACHE_PCT="$BUDGET_OVERRIDE"
@@ -1289,7 +1307,10 @@ build_recommended_block() {
 
         MAX_WORKERS=$(round_down_to_multiple_of_8 "$RAW_MAX_WORKERS")
         (( MAX_WORKERS > MRW_CAP_PREFORK )) && MAX_WORKERS=$MRW_CAP_PREFORK
-        (( MAX_WORKERS < 128 )) && MAX_WORKERS=128
+        # A value below 128 here means the RAM budget cannot hold 128 prefork
+        # children; keep the RAM-derived value instead of overcommitting
+        # memory, with an absolute minimum of 16 workers.
+        (( MAX_WORKERS < 16 )) && MAX_WORKERS=16
 
         SERVER_LIMIT=$(calculate_server_limit_with_buffer "$MAX_WORKERS")
         MIN_SPARE_SERVERS=$(round_down_to_multiple_of_8 "$MIN_SPARE")
@@ -1393,12 +1414,16 @@ reload_apache() {
 
 config_matches_recommendation() {
     local FILE="$1"
-    local EXISTING_BLOCK
+    local EXISTING_BLOCK RENDERED_BLOCK
 
     EXISTING_BLOCK=$(extract_tuner_block "$FILE")
     [[ -z "$EXISTING_BLOCK" ]] && return 1
 
-    [[ "$(normalize_block_for_compare "$EXISTING_BLOCK")" == "$(normalize_block_for_compare "$RECOMMENDED_BLOCK")" ]]
+    # RECOMMENDED_BLOCK holds literal \n escapes until written with printf %b;
+    # render it the same way before comparing against real file content.
+    RENDERED_BLOCK=$(printf "%b" "$RECOMMENDED_BLOCK")
+
+    [[ "$(normalize_block_for_compare "$EXISTING_BLOCK")" == "$(normalize_block_for_compare "$RENDERED_BLOCK")" ]]
 }
 
 # Decide how to respond after applying the block (rollback, log, or reload).
